@@ -1,0 +1,721 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Kingdom-Style Prototype v4.6 (Diagnostic Build)</title>
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<style>
+  :root { --bg:#0b0f16; --fg:#eaf1ff; --panel:#111827; --accent:#60a5fa; --bad:#ef4444; --ok:#22c55e; }
+  html,body { margin:0; height:100%; background:var(--bg); color:var(--fg); font-family:system-ui,Segoe UI,Roboto,Arial,sans-serif; }
+  #wrap { display:flex; flex-direction:column; height:100%; }
+  header, footer {
+    display:flex; align-items:center; justify-content:space-between;
+    padding:8px 12px; gap:12px; background:rgba(255,255,255,0.06); border-bottom:1px solid rgba(255,255,255,0.08);
+  }
+  footer { border-top:1px solid rgba(255,255,255,0.08); border-bottom:none; }
+  #stage { flex:1; display:flex; align-items:center; justify-content:center; background:#0b0f16; }
+  canvas { display:block; image-rendering: pixelated; image-rendering: crisp-edges; background:#1c2333; box-shadow: 0 10px 30px rgba(0,0,0,0.4); cursor: crosshair; }
+  .btn { cursor:pointer; padding:6px 10px; border-radius:10px; border:1px solid rgba(255,255,255,0.15); background:rgba(255,255,255,0.08); color:var(--fg); }
+  .stat { font-variant-numeric:tabular-nums; }
+  #phase { margin-left:8px; padding:2px 6px; border-radius:6px; background: rgba(255,255,255,0.08); }
+  /* Debug panel */
+  #debug {
+    position: fixed; right: 10px; bottom: 10px; width: 420px; max-height: 50vh; overflow:auto;
+    background: var(--panel); border:1px solid #ffffff20; border-radius:12px; padding:10px; box-shadow: 0 10px 30px rgba(0,0,0,0.5);
+  }
+  #debug h3 { margin:0 0 6px 0; font-size:14px; display:flex; align-items:center; justify-content:space-between; }
+  #debug pre { white-space: pre-wrap; word-break: break-word; margin:0; font:12px/1.35 ui-monospace,SFMono-Regular,Consolas,Monaco,monospace; }
+  .tag { padding:2px 6px; border-radius:999px; background:#ffffff1a; font-size:11px; }
+  .row { display:flex; gap:8px; align-items:center; flex-wrap:wrap }
+  .ok { color: var(--ok) } .bad { color: var(--bad) }
+  #debug-toggle { position: fixed; right: 10px; bottom: 10px; z-index: 1; }
+</style>
+
+<!-- SAFETY SHIM: safe document.write/writeln → JSON script capture to prevent ':' parser errors -->
+<script>
+(function(){
+  const q = []; let idx = 0;
+  const orig = { write: document.write.bind(document), writeln: document.writeln.bind(document) };
+  function looksHtml(s){
+    if (typeof s !== 'string') return false;
+    const t = s.trim();
+    if (!t) return false;
+    if (/^[\:\{\[]/.test(t)) return false;
+    if (/^\s*[A-Za-z0-9_\-]+\s*\:/.test(t)) return false;
+    if (/^\s*<\!--/.test(t)) return true;
+    if (/^\s*<\w+[\s>]/.test(t)) return true;
+    if (/<[a-z][\s\S]*>/.test(t)) return true;
+    return false;
+  }
+  function appendHtml(html){
+    const d = document.createElement('div'); d.innerHTML = html;
+    while (d.firstChild) (document.body||document.documentElement).appendChild(d.firstChild);
+  }
+  function appendJson(text){
+    const s = document.createElement('script');
+    s.type = 'application/json'; s.setAttribute('data-safe-write','true'); s.setAttribute('data-index', String(idx++));
+    s.textContent = String(text);
+    (document.body||document.documentElement).appendChild(s);
+  }
+  function handle(args){
+    const s = Array.prototype.map.call(args, a=>String(a)).join('');
+    if (looksHtml(s)) appendHtml(s); else appendJson(s);
+  }
+  function intercept(){ q.push(Array.from(arguments)); if (document.readyState!=='loading') flush(); }
+  function flush(){ while(q.length){ try{ handle(q.shift()); }catch(e){ console.warn('[write-shim]', e); } } }
+  document.write = intercept; document.writeln = function(){ intercept.apply(null, arguments); };
+  if (document.readyState==='loading') document.addEventListener('DOMContentLoaded', flush, {once:true}); else flush();
+  // helpers
+  window.__looksHtml = looksHtml;
+})();
+</script>
+</head>
+<body>
+<div id="wrap">
+  <header>
+    <div>👑 Kingdom‑Style Prototype <span class="stat">v4.6 • Diagnostic</span> <span id="phase">Morning</span></div>
+    <div class="stat" id="hud"></div>
+    <div class="row">
+      <button id="btnFS" class="btn" title="Alt+Enter also works">⤢ Fullscreen</button>
+      <span class="tag">F1: Toggle Debug</span>
+    </div>
+  </header>
+  <div id="stage">
+    <canvas id="game" width="1920" height="1080"></canvas>
+  </div>
+  <footer>
+    <div>Controls: A/D or ←/→ move • LMB sword • C catapult volley • T rune • Shift dash • H toggle mount • E interact (buy/build) • Alt+Enter fullscreen</div>
+  </footer>
+</div>
+
+<button id="debug-toggle" class="btn" title="Show/Hide Debug (F1)">🐞</button>
+<div id="debug" hidden>
+  <h3>Diagnostics
+    <span class="row">
+      <span id="fps" class="tag">FPS: —</span>
+      <span id="mem" class="tag">Mem: —</span>
+    </span>
+  </h3>
+  <div class="row">
+    <span id="lastErr" class="bad">No errors</span>
+  </div>
+  <pre id="log"></pre>
+</div>
+
+<script>
+/* Basic debug overlay (errors, FPS, unhandled rejections) */
+(function(){
+  const panel = document.getElementById('debug');
+  const btn = document.getElementById('debug-toggle');
+  const lastErr = document.getElementById('lastErr');
+  const log = document.getElementById('log');
+  const fpsEl = document.getElementById('fps');
+  const memEl = document.getElementById('mem');
+
+  function append(line, cls){
+    const t = new Date().toISOString().split('T')[1].replace('Z','');
+    log.textContent += `[${t}] ${line}\n`;
+    if (cls) lastErr.className = cls;
+    lastErr.textContent = line;
+  }
+
+  window.addEventListener('error', (e)=>{
+    append(`Error: ${e.message} @ ${e.filename}:${e.lineno}:${e.colno}`, 'bad');
+  });
+  window.addEventListener('unhandledrejection', (e)=>{
+    append(`Unhandled rejection: ${e.reason && e.reason.message || e.reason}`, 'bad');
+  });
+  console.error = new Proxy(console.error, { apply(t, thisArg, args){ append('console.error: ' + args.join(' '), 'bad'); return Reflect.apply(t, thisArg, args); } });
+
+  btn.addEventListener('click', ()=> panel.hidden = !panel.hidden);
+  window.addEventListener('keydown', (e)=>{ if (e.key==='F1'){ e.preventDefault(); panel.hidden = !panel.hidden; } });
+
+  // FPS
+  let last = performance.now(), frames = 0, acc = 0;
+  function tick(){
+    const now = performance.now();
+    const dt = now - last; last = now; frames++; acc += dt;
+    if (acc >= 500){
+      const fps = Math.round(frames * 1000 / acc);
+      fpsEl.textContent = 'FPS: ' + fps;
+      frames = 0; acc = 0;
+      if (performance && performance.memory){
+        const m = performance.memory;
+        memEl.textContent = `Mem: ${(m.usedJSHeapSize/1048576|0)}MB / ${(m.jsHeapSizeLimit/1048576|0)}MB`;
+      }
+    }
+    requestAnimationFrame(tick);
+  }
+  tick();
+})();
+</script>
+
+<script>
+/* ---- Game code from v4.6 (unchanged gameplay) ---- */
+const canvas = document.getElementById('game');
+const ctx = canvas.getContext('2d');
+const stage = document.getElementById('stage');
+const hud = document.getElementById('hud');
+const btnFS = document.getElementById('btnFS');
+const phaseEl = document.getElementById('phase');
+
+const INTERNAL_W = 1920;
+const INTERNAL_H = 1080;
+
+function fitCanvasToStage(){
+  const sw = stage.clientWidth, sh = stage.clientHeight;
+  const scale = Math.min(sw / INTERNAL_W, sh / INTERNAL_H);
+  canvas.style.width = Math.round(INTERNAL_W * scale) + 'px';
+  canvas.style.height = Math.round(INTERNAL_H * scale) + 'px';
+}
+window.addEventListener('resize', fitCanvasToStage);
+async function enterFullscreen(){
+  const root = document.documentElement;
+  if (!document.fullscreenElement){ try { await root.requestFullscreen(); } catch (e) { console.error('Fullscreen error:', e); } }
+  fitCanvasToStage();
+}
+btnFS.addEventListener('click', enterFullscreen);
+window.addEventListener('keydown', (e)=>{
+  if (e.altKey && e.key.toLowerCase()==='enter'){ e.preventDefault(); enterFullscreen(); }
+});
+
+const CONFIG = {
+  S: 2.0,
+  groundY: 840,
+  PIX: 5,               // micro-pixel mode
+  HUMAN_SCALE: 1.5,
+  HORSE_SCALE: 2.0,
+  baseSpeed: 4.0,
+  playerSize: 40,
+  FT_TO_PX: 5,
+  MAX_HP: 15
+};
+const EXTRA_FT = 1500;
+const EXTRA_PX = EXTRA_FT * CONFIG.FT_TO_PX;
+const WORLD = { w: INTERNAL_W + EXTRA_PX, h: INTERNAL_H };
+const TOWN_X = Math.round(WORLD.w / 2);
+
+const keys = new Set();
+let mouseDown = false;
+
+const camera = { x: 0 };
+function clamp(v,a,b){ return Math.max(a, Math.min(b, v)); }
+
+const COSTS = { PEASANT: 5, WALL: 3, RANGER: 4, BOW: 2, SWORD: 2, HAMMER: 2 };
+
+const CAMP_DIST = 100 * CONFIG.FT_TO_PX;
+const WALL_STEP = 60 * CONFIG.FT_TO_PX;
+const WALL_MIN_FROM_TOWN = 2 * WALL_STEP;
+const WALL_MAX_FROM_TOWN = 300 * CONFIG.FT_TO_PX;
+
+const CYCLE_PARTS = { morning:2, noon:1, night:1, dawn:1 };
+const PART_SUM = CYCLE_PARTS.morning + CYCLE_PARTS.noon + CYCLE_PARTS.night + CYCLE_PARTS.dawn;
+const DAY_LEN = 200;
+let nightIndex = 0;
+
+const DMG = { enemy:1, big:2 };
+const PLAYER_DMG = 1;
+const CATAPULT_DMG = 4;
+
+let state = {
+  player: {
+    x: TOWN_X, y: CONFIG.groundY - CONFIG.playerSize/2,
+    baseSpeed: CONFIG.baseSpeed,
+    holdingRune: false,
+    dashActive: false, dashCD: 0, dashTime: 0,
+    onHorse: true, facing: 1,
+    hp: CONFIG.MAX_HP, maxHp: CONFIG.MAX_HP,
+    attackCD: 0, swingT: 0
+  },
+  coins: 30,
+  peasants: [], archers: [], swords: [], builders: [],
+  trees: [], apples: [],
+  camps: [],
+  wallSites: [], walls: [],
+  rangerSites: [], rangers: [], arrows: [],
+  catapults: [], projectiles: [],
+  gates: [], enemies: [],
+  deer: [],
+  archways: [],
+  stands: [],
+  time: 0, cycle: 0
+};
+
+function currentSpeed(p){ return p.baseSpeed * (p.holdingRune ? 2 : 1); }
+function effectiveSpeed(p){ return currentSpeed(p) * (p.dashActive ? 2 : 1); }
+function pxRect(x, y, w, h, c){ ctx.fillStyle=c; ctx.fillRect(Math.round(x), Math.round(y), Math.round(w), Math.round(h)); }
+function hpBar(x, y, w, h, hp, hpMax){
+  const left = x - w/2 - camera.x;
+  pxRect(left, y, w, h, '#3a2f2f');
+  const f = Math.max(0, Math.min(1, hp/hpMax));
+  pxRect(left+1, y+1, (w-2)*f, h-2, f>0.5?'#65d46e':(f>0.25?'#ffd966':'#ff6b6b'));
+}
+function microFill(x, y, w, h, color, density=1){
+  ctx.fillStyle = color;
+  const step = Math.max(1, Math.floor(CONFIG.PIX / 2));
+  for(let iy=0; iy<h; iy+=step){
+    for(let ix=0; ix<w; ix+=step){
+      if (((ix+iy)/step) % (2/density) < 1) { ctx.fillRect(Math.round(x+ix), Math.round(y+iy), step, step); }
+    }
+  }
+}
+
+function drawBackground(){
+  const ph = cyclePhase(state.cycle);
+  let top='#82b8ff', bot='#e1f0ff';
+  if (ph==='Night'){ top='#0a1230'; bot='#0e1a40'; }
+  else if (ph==='Dawn'){ top='#f5d08a'; bot='#ffe7c0'; }
+  else if (ph==='Noon'){ top='#76adff'; bot='#c7e1ff'; }
+  const sky = ctx.createLinearGradient(0,0,0,INTERNAL_H);
+  sky.addColorStop(0,top); sky.addColorStop(1,bot);
+  ctx.fillStyle = sky; ctx.fillRect(0,0,INTERNAL_W,INTERNAL_H);
+
+  ctx.fillStyle = ph==='Night' ? '#11251f' : '#1f3f33';
+  for(let i=0;i<26;i++){
+    const x = (i*260 - camera.x*0.22) % (INTERNAL_W+260) - 130;
+    microFill(x, CONFIG.groundY-230, 40, 230, ctx.fillStyle, 1);
+  }
+  ctx.fillStyle = ph==='Night' ? '#183a30' : '#275a47';
+  for(let i=0;i<34;i++){
+    const x = (i*220 - camera.x*0.42) % (INTERNAL_W+220) - 110;
+    microFill(x, CONFIG.groundY-170, 70, 120, ctx.fillStyle, 1);
+    microFill(x+50, CONFIG.groundY-190, 50, 140, ctx.fillStyle, 1);
+  }
+}
+function drawGrass(){
+  ctx.fillStyle = '#2b334a';
+  ctx.fillRect(-camera.x, CONFIG.groundY, WORLD.w, 4*CONFIG.S);
+  for(let i=0;i<540;i++){
+    const x = (i*12 - camera.x) % (INTERNAL_W+24) - 12;
+    const h = (6 + (i%7)) * 3;
+    microFill(x, CONFIG.groundY- h, 2, h, '#43b06a', 1.5);
+  }
+}
+
+function cyclePhase(t){
+  const m = CYCLE_PARTS.morning / PART_SUM;
+  const n = CYCLE_PARTS.noon / PART_SUM;
+  const ni = CYCLE_PARTS.night / PART_SUM;
+  if (t < m) return 'Morning';
+  if (t < m+n) return 'Noon';
+  if (t < m+n+ni) return 'Night';
+  return 'Dawn';
+}
+
+function spawnCamps(){ state.camps = [ { x: TOWN_X - CAMP_DIST, y: CONFIG.groundY }, { x: TOWN_X + CAMP_DIST, y: CONFIG.groundY } ]; }
+function drawCamp(c){
+  microFill(c.x - 30 - camera.x, c.y - 30, 60, 30, '#6b4f2a', 1.2);
+  microFill(c.x - 18 - camera.x, c.y - 48, 36, 12, '#87633a', 1.2);
+  ctx.fillStyle='#000'; ctx.font='12px system-ui'; ctx.fillText('Peasant 5g', c.x - camera.x + 12, c.y - 38);
+}
+function tryBuyPeasantAt(c){
+  const near = Math.abs(state.player.x - c.x) < 60;
+  if (!near) return false;
+  if (state.coins >= COSTS.PEASANT){ state.coins -= COSTS.PEASANT; state.peasants.push(makeUnit(c.x)); return true; }
+  return false;
+}
+function makeUnit(x){
+  return { x, y: CONFIG.groundY - CONFIG.playerSize/2, alive:true, role:'peasant', facing:1, anim:0, held:null };
+}
+function drawHuman(x, baselineY, role, facing=1, held=null, anim=0){
+  const p = CONFIG.PIX * CONFIG.HUMAN_SCALE, w = 8*p, h = 13*p;
+  const left = x - w/2 - camera.x, top  = baselineY - h;
+  const palette = (role==='peasant')
+    ? { torso:'#a67c52', leg:'#434343', arm:'#f0d0a8', helm:'#5a4a3a' }
+    : (role==='archer')
+      ? { torso:'#2f6a3a', leg:'#2b2b2b', arm:'#f0d0a8', helm:'#5a694a' }
+      : (role==='builder')
+        ? { torso:'#6a5a2f', leg:'#2b2b2b', arm:'#f0d0a8', helm:'#7a6a3a' }
+        : { torso:'#2f49a3', leg:'#2b2b2b', arm:'#f0d0a8', helm:'#d4af37' };
+  microFill(left+2*p, top+5*p, 4*p, 6*p, palette.torso, 2);
+  microFill(left+1*p, top+11*p, 2*p, 2*p, palette.leg, 2);
+  microFill(left+5*p, top+11*p, 2*p, 2*p, palette.leg, 2);
+  microFill(left+0*p, top+7*p, 2*p, 2*p, palette.arm, 2);
+  microFill(left+6*p, top+7*p, 2*p, 2*p, palette.arm, 2);
+  microFill(left+2*p, top+1.5*p, 4*p, 3.5*p, '#f3d3b0', 2);
+  microFill(left+2*p, top+1.2*p, 4*p, 0.8*p, palette.helm, 2);
+
+  if (held==='bow'){
+    microFill(left+(facing>0?6*p: -1*p), top+6*p, 6*p*facing, 2*p, '#d9c2a1', 2);
+    if (anim>0){ microFill(left+4*p, top+6*p, 2, 2*p, '#eee', 2); }
+  } else if (held==='sword'){
+    microFill(left+(facing>0?6*p:1*p), top+6*p, 6*p*facing, 2*p, '#dbe6ff', 2);
+  } else if (held==='hammer'){
+    microFill(left+(facing>0?6*p:1*p), top+6*p, 3*p*facing, 2*p, '#b0a08a', 2);
+    microFill(left+(facing>0?9*p: -2*p), top+5*p, 2*p, 3*p, '#6a5a4a', 2);
+  }
+}
+function updateUnits(dt, arr){
+  arr.forEach(u=>{ if(!u.alive) return;
+    const dx = state.player.x - u.x; u.x += Math.sign(dx) * Math.min(Math.abs(dx), 60*dt);
+    if (Math.abs(dx)>1) u.facing = Math.sign(dx);
+    if (u.anim>0) u.anim -= dt;
+  });
+}
+
+function spawnStands(){
+  state.stands = [
+    { type:'bow', x: TOWN_X - 160, y: CONFIG.groundY, cost:COSTS.BOW },
+    { type:'sword', x: TOWN_X, y: CONFIG.groundY, cost:COSTS.SWORD },
+    { type:'hammer', x: TOWN_X + 160, y: CONFIG.groundY, cost:COSTS.HAMMER }
+  ];
+}
+function drawStand(s){
+  const left = s.x - 22 - camera.x;
+  if (s.type==='bow'){
+    microFill(left, CONFIG.groundY - 30, 44, 30, '#4e3a2a', 1.2);
+    microFill(left+30, CONFIG.groundY - 24, 10, 8, '#d9c2a1', 2);
+    ctx.fillStyle='#ddd'; ctx.font='12px system-ui'; ctx.fillText('Bow 2g', s.x - 18 - camera.x, CONFIG.groundY - 36);
+  } else if (s.type==='sword'){
+    microFill(left, CONFIG.groundY - 30, 44, 30, '#4e3a2a', 1.2);
+    microFill(left+28, CONFIG.groundY - 26, 12, 12, '#dbe6ff', 2);
+    ctx.fillStyle='#ddd'; ctx.font='12px system-ui'; ctx.fillText('Sword 2g', s.x - 22 - camera.x, CONFIG.groundY - 36);
+  } else {
+    microFill(left, CONFIG.groundY - 30, 44, 30, '#4e3a2a', 1.2);
+    microFill(left+26, CONFIG.groundY - 26, 12, 12, '#b0a08a', 2);
+    ctx.fillStyle='#ddd'; ctx.font='12px system-ui'; ctx.fillText('Hammer 2g', s.x - 28 - camera.x, CONFIG.groundY - 36);
+  }
+}
+function tryEquipFromStand(s){
+  const pz = state.peasants.find(p => Math.abs(p.x - s.x) < 60);
+  if (!pz) return false;
+  if (state.coins < s.cost) return false;
+  state.coins -= s.cost;
+  if (s.type==='bow'){
+    pz.role='archer'; pz.held='bow'; state.archers.push(pz); state.peasants = state.peasants.filter(u=>u!==pz);
+  } else if (s.type==='sword'){
+    pz.role='swordsman'; pz.held='sword'; state.swords.push(pz); state.peasants = state.peasants.filter(u=>u!==pz);
+  } else {
+    pz.role='builder'; pz.held='hammer'; state.builders.push(pz); state.peasants = state.peasants.filter(u=>u!==pz);
+  }
+  return true;
+}
+
+function spawnWallSites(){
+  const margin = 100;
+  for(let x = TOWN_X - WALL_MIN_FROM_TOWN; x >= Math.max(margin, TOWN_X - WALL_MAX_FROM_TOWN); x -= WALL_STEP){
+    state.wallSites.push({x, built:false});
+  }
+  for(let x = TOWN_X + WALL_MIN_FROM_TOWN; x <= Math.min(WORLD.w - margin, TOWN_X + WALL_MAX_FROM_TOWN); x += WALL_STEP){
+    state.wallSites.push({x, built:false});
+  }
+}
+function drawWallSite(s){
+  if(s.built) return;
+  pxRect(s.x - 15 - camera.x, CONFIG.groundY - 18, 30, 18, '#3a3a3a');
+  ctx.fillStyle='#ddd'; ctx.font='12px system-ui'; ctx.fillText('E: Wall (3g)', s.x - 28 - camera.x, CONFIG.groundY - 22);
+}
+function tryBuildWallAtSite(site){
+  const near = Math.abs(state.player.x - site.x) < 60;
+  if(!near || site.built) return false;
+  if(state.coins >= COSTS.WALL){
+    state.coins -= COSTS.WALL;
+    site.built = true;
+    const wall = { x: site.x, y: CONFIG.groundY, hp:5, hpMax:5 };
+    state.walls.push(wall);
+    const towardTown = site.x < TOWN_X ? +1 : -1;
+    const catX = site.x + towardTown * (10 * CONFIG.FT_TO_PX);
+    state.catapults.push({ x: catX, side: towardTown, cd: Math.random()*1.5, range: 380 });
+    return true;
+  }
+  return false;
+}
+function drawWall(wl){
+  microFill(wl.x - 20 - camera.x, CONFIG.groundY - 60, 40, 60, '#7b6b5b', 1.5);
+  hpBar(wl.x, CONFIG.groundY - 68, 46, 6, wl.hp, wl.hpMax);
+}
+
+function spawnRangerSites(){
+  for(let x = 200; x < WORLD.w-200; x += 600){
+    if (Math.abs(x - TOWN_X) < 200) continue;
+    state.rangerSites.push({ x, built:false });
+  }
+}
+function drawRangerSite(s){
+  if(s.built) return;
+  pxRect(s.x - 14 - camera.x, CONFIG.groundY - 18, 28, 18, '#36513a');
+  ctx.fillStyle='#ddd'; ctx.font='12px system-ui'; ctx.fillText('E: Ranger (4g)', s.x - 40 - camera.x, CONFIG.groundY - 22);
+}
+function tryBuildRangerAtSite(site){
+  const near = Math.abs(state.player.x - site.x) < 60;
+  if(!near || site.built) return false;
+  if(state.coins >= COSTS.RANGER){
+    state.coins -= COSTS.RANGER;
+    site.built = true;
+    state.rangers.push({ x: site.x, hp:3, hpMax:3, cd: 0, garrison:null, rate:2.2 });
+    return true;
+  }
+  return false;
+}
+function drawRanger(r){
+  microFill(r.x - 13 - camera.x, CONFIG.groundY - 58, 26, 58, '#486a52', 1.5);
+  microFill(r.x - 9 - camera.x, CONFIG.groundY - 66, 18, 8, '#2e3a33', 1.5);
+  hpBar(r.x, CONFIG.groundY - 72, 40, 6, r.hp, r.hpMax);
+  if (r.garrison){ microFill(r.x - 2 - camera.x, CONFIG.groundY - 80, 12, 6, '#ffd966', 2); }
+}
+function updateRangers(dt){
+  for(const r of state.rangers){
+    if (r.cd>0) r.cd -= dt;
+    const fireEvery = r.garrison ? r.rate*0.6 : r.rate;
+    if (r.cd<=0){
+      const t = state.enemies.filter(e=> Math.abs(e.x - r.x) < 520).sort((a,b)=>Math.abs(a.x - r.x) - Math.abs(b.x - r.x))[0];
+      if (t){
+        const dir = Math.sign(t.x - r.x) || 1;
+        state.arrows.push({ x: r.x, y: CONFIG.groundY - 70, vx: dir*520, vy: -80, dmg: 2 });
+        r.cd = fireEvery;
+      }
+    }
+  }
+}
+
+function drawCatapult(c){
+  microFill(c.x - 22 - camera.x, CONFIG.groundY - 26, 44, 26, '#6b5a49', 1.2);
+  microFill(c.x + 5 - camera.x, CONFIG.groundY - 38, 6, 12, '#8a775f', 1.2);
+  microFill(c.x + 1 - camera.x, CONFIG.groundY - 42, 14, 6, '#9a8a70', 1.2);
+}
+
+let perfNow = 0;
+function spawnGates(){ state.gates = [ { x: 60, dir: +1, spawnCD: 0 }, { x: WORLD.w - 60, dir: -1, spawnCD: 0 } ]; }
+function drawGate(g){
+  microFill(g.x - 20 - camera.x, CONFIG.groundY - 120, 40, 120, '#2e2540', 1.2);
+  const glow = (Math.sin(perfNow*2)+1)*0.15 + 0.15; ctx.globalAlpha = glow; pxRect(g.x - 16 - camera.x, CONFIG.groundY - 110, 32, 100, '#a06bff'); ctx.globalAlpha = 1;
+}
+function spawnAllowed(){ return cyclePhase(state.cycle) === 'Night'; }
+function spawnScale(){ return Math.max(0.2, 0.4 + 0.05 * nightIndex); }
+function updateGates(dt){
+  if(!spawnAllowed()) return; const scale = spawnScale();
+  for (const g of state.gates){
+    g.spawnCD -= dt; const baseCD = 4.2;
+    if (g.spawnCD <= 0){
+      const cd = baseCD / scale; g.spawnCD = cd;
+      const isBig = Math.random() < 0.18;
+      state.enemies.push({ x: g.x + g.dir*20, y: CONFIG.groundY - CONFIG.playerSize/2, hp: isBig ? 7 : 3, speed: (isBig? 26: 46) + Math.random()*12, dir: g.dir, big: isBig, atkCD: 0, aggro: false, windup: 0 });
+    }
+  }
+}
+function drawEnemy(e){
+  const p = CONFIG.PIX; const x = e.x - camera.x, y = e.y;
+  if (e.big){
+    const s = 1.9;
+    microFill(x-4*p*s, y-3*p*s, 8*p*s, 3*p*s, '#6b8f4a', 2);
+    microFill(x-5*p*s, y-10*p*s, 10*p*s, 7*p*s, '#7aa95a', 2);
+    microFill(x-3*p*s, y-13*p*s, 6*p*s, 3*p*s, '#d2c6a1', 2);
+  } else {
+    const s = 1.1;
+    microFill(x-5*p*s, y-2*p*s, 10*p*s, 2*p*s, '#3a2a1a', 2);
+    microFill(x+4*p*s, y-4*p*s, 3*p*s, 2*p*s, '#3a2a1a', 2);
+  }
+}
+
+const CATAPULT_CD = 3.0;
+function updateCatapults(dt){
+  for (const c of state.catapults){
+    c.cd -= dt;
+    if (c.cd <= 0){
+      const targets = state.enemies.filter(e => Math.abs(e.x - c.x) < 380 && ((c.side>0 && e.x>c.x) || (c.side<0 && e.x<c.x)));
+      if (targets.length){
+        const t = targets.sort((a,b)=> Math.abs(a.x-c.x) - Math.abs(b.x-c.x))[0];
+        fireProjectile(c.x, c.side, t.x);
+        c.cd = 2.8 + Math.random()*1.5;
+      } else {
+        c.cd = 1.0;
+      }
+    }
+  }
+  state.projectiles.forEach(p => { p.vy += 600*dt; p.x += p.vx * dt; p.y += p.vy * dt; if (p.y >= CONFIG.groundY - 6){ explode(p.x); p._dead = true; } });
+  state.projectiles = state.projectiles.filter(p=>!p._dead);
+}
+function fireProjectile(x, dir, targetX){
+  const speed = 520;
+  const angle = Math.atan2(-260, (targetX - x));
+  const vx = Math.cos(angle) * speed * Math.sign(targetX-x||dir);
+  const vy = Math.sin(angle) * speed;
+  state.projectiles.push({ x, y: CONFIG.groundY - 70, vx, vy });
+}
+function explode(cx){
+  const radius = 140;
+  for (const e of state.enemies){ if (Math.abs(e.x - cx) < radius){ e.hp -= CATAPULT_DMG; } }
+  for(let i=0;i<5;i++){ pxRect(cx - camera.x + i*6-12, CONFIG.groundY - 80 - i*6, 8, 8, '#d9d2c0'); }
+}
+function updateArrows(dt){
+  state.arrows.forEach(a=>{
+    a.vy += 600*dt; a.x += a.vx * dt; a.y += a.vy * dt;
+    if (a.y >= CONFIG.groundY - 6){ a._dead = true; }
+    for (const e of state.enemies){
+      if (Math.abs(e.x - a.x) < 24 && Math.abs(CONFIG.groundY - a.y) < 64){ e.hp -= a.dmg || 2; a._dead = true; break; }
+    }
+  });
+  state.arrows = state.arrows.filter(a=>!a._dead);
+}
+
+function drawHorse(x, baselineY, facing){
+  const scale = CONFIG.PIX * CONFIG.HORSE_SCALE;
+  ctx.save(); ctx.translate(x - camera.x, baselineY); ctx.scale(facing===-1 ? -1 : 1, 1);
+  const w = 18*scale, h = 11*scale; const left = - w/2, top = - h;
+  microFill(left+2*scale, top+4*scale, 12*scale, 4*scale, '#7b5a3a', 1.5);
+  microFill(left+11*scale, top+2*scale, 3*scale, 3*scale, '#7b5a3a', 1.5);
+  microFill(left+14*scale, top+1.5*scale, 2*scale, 2*scale, '#7b5a3a', 1.5);
+  microFill(left+4*scale, top+8*scale, 1.5*scale, 3*scale, '#674a2f', 1.5);
+  microFill(left+7*scale, top+8*scale, 1.5*scale, 3*scale, '#674a2f', 1.5);
+  microFill(left+10*scale, top+8*scale, 1.5*scale, 3*scale, '#674a2f', 1.5);
+  microFill(left+12*scale, top+8*scale, 1.5*scale, 3*scale, '#674a2f', 1.5);
+  ctx.restore();
+}
+function swordAttack(){
+  if (state.player.attackCD>0) return;
+  state.player.attackCD = 0.28;
+  state.player.swingT = 0.22;
+  const range = 54;
+  const px = state.player.x + (state.player.facing>0 ? 22 : -22);
+  for (const e of state.enemies){ if (Math.abs(e.x - px) < range){ e.hp -= PLAYER_DMG; } }
+}
+canvas.addEventListener('mousedown', ()=>{ mouseDown = true; swordAttack(); });
+canvas.addEventListener('mouseup', ()=>{ mouseDown = false; });
+
+let last = 0;
+function loop(ts){
+  const dt = Math.min(0.05, (ts - last) / 1000 || 0); last = ts; perfNow = ts/1000;
+  update(dt); draw(); requestAnimationFrame(loop);
+}
+
+function update(dt){
+  const p = state.player;
+  state.time += dt; state.cycle = (state.time % DAY_LEN) / DAY_LEN;
+  const ph = cyclePhase(state.cycle); phaseEl.textContent = ph + ' (Night ' + nightIndex + ')';
+  if (ph==='Night' && (state._lastPhase!=='Night')){ nightIndex += 1; }
+  state._lastPhase = ph;
+
+  if (p.dashActive){ p.dashTime -= dt; if (p.dashTime <= 0) p.dashActive = false; }
+  if (p.dashCD > 0) p.dashCD -= dt;
+  if (p.attackCD > 0) p.attackCD -= dt;
+  if (p.swingT > 0) p.swingT -= dt;
+
+  const left  = keys.has('a') || keys.has('arrowleft');
+  const right = keys.has('d') || keys.has('arrowright');
+  const interact = keys.has('e');
+  const vx = (right?1:0) - (left?1:0);
+  if (vx !== 0) state.player.facing = vx>0?1:-1;
+  p.x += vx * effectiveSpeed(p) * 60 * dt;
+  p.x = clamp(p.x, 20, WORLD.w - 20);
+
+  camera.x = clamp(p.x - INTERNAL_W/2, 0, WORLD.w - INTERNAL_W);
+
+  if (interact && (!state.interactCD || state.interactCD<=0)){
+    for (const c of state.camps){ if (tryBuyPeasantAt(c)) break; }
+    const nearWall = state.wallSites.find(s=>!s.built && Math.abs(p.x - s.x) < 60); if (nearWall) { if (tryBuildWallAtSite(nearWall)){ state.builders.forEach(b=>{ b.anim=0.3; }); } }
+    const nearR = state.rangerSites.find(s=>!s.built && Math.abs(p.x - s.x) < 60); if (nearR) { if (tryBuildRangerAtSite(nearR)){ state.builders.forEach(b=>{ b.anim=0.3; }); } }
+    const nearStand = state.stands.find(s=>Math.abs(p.x - s.x) < 60); if (nearStand) tryEquipFromStand(nearStand);
+    const station = state.rangers.find(r=>!r.garrison && Math.abs(p.x - r.x)<80);
+    if (station){
+      const ar = state.archers.find(a=>Math.abs(a.x - station.x)<100);
+      if (ar){ station.garrison = ar; station.rate = 2.0; ar._garrisoned = station; }
+    }
+    state.interactCD = 0.25;
+  }
+  if (state.interactCD>0) state.interactCD -= dt;
+
+  updateUnits(dt, state.peasants);
+  updateUnits(dt, state.archers);
+  updateUnits(dt, state.swords);
+  updateUnits(dt, state.builders);
+
+  state.archers.forEach(a=>{
+    a.anim = Math.max(0, a.anim - dt);
+    if (!a._cd) a._cd=0;
+    a._cd -= dt;
+    if (a._garrisoned) return;
+    if (a._cd<=0){
+      const t = state.enemies.sort((x,y)=>Math.abs(x.x - a.x) - Math.abs(y.x - a.x))[0];
+      if (t && Math.abs(t.x - a.x) < 520){
+        const dir = Math.sign(t.x - a.x) || 1;
+        state.arrows.push({ x: a.x, y: CONFIG.groundY - 60, vx: dir*520, vy: -80, dmg: 2 });
+        a._cd = 2.1; a.anim = 0.2;
+      }
+    }
+  });
+
+  updateGates(dt);
+  updateCatapults(dt);
+  updateRangers(dt);
+  updateArrows(dt);
+
+  hud.textContent = `Gold=${state.coins}  HP=${state.player.hp}/${state.player.maxHp}  Peasants=${state.peasants.length}  Archers=${state.archers.length}  Swords=${state.swords.length}  Builders=${state.builders.length}  Walls=${state.walls.length}  Rangers=${state.rangers.length}`;
+}
+
+function draw(){
+  ctx.clearRect(0,0,INTERNAL_W,INTERNAL_H);
+  drawBackground();
+  drawGrass();
+  microFill(TOWN_X - 2*CONFIG.S - camera.x, CONFIG.groundY - 80, 4*CONFIG.S, 80, '#6aa0ff', 1.2);
+
+  state.camps.forEach(drawCamp);
+  state.trees.forEach(()=>{}); // trees were not used in this diag baseline
+  state.apples.forEach(()=>{});
+  state.gates.forEach(drawGate);
+  state.wallSites.forEach(drawWallSite);
+  state.rangerSites.forEach(drawRangerSite);
+  state.stands.forEach(drawStand);
+  state.walls.forEach(drawWall);
+  state.catapults.forEach(drawCatapult);
+  state.rangers.forEach(drawRanger);
+  state.enemies.forEach(drawEnemy);
+
+  ctx.fillStyle='#eae1c8';
+  state.arrows.forEach(a=>{ ctx.fillRect(a.x - camera.x, a.y, 6, 2); });
+  ctx.fillStyle='#d9d2c0';
+  state.projectiles.forEach(p=>{ ctx.beginPath(); ctx.arc(p.x - camera.x, p.y, 6, 0, Math.PI*2); ctx.fill(); });
+
+  drawHuman(state.player.x - 8, CONFIG.groundY - 20, 'swordsman', state.player.facing, 'sword', state.player.swingT>0?0.2:0);
+  drawHorse(state.player.x + 6, CONFIG.groundY - 4*CONFIG.S, state.player.facing);
+
+  if (state.player.swingT > 0){
+    const t = state.player.swingT;
+    const dir = state.player.facing>0?1:-1;
+    const cx = state.player.x - camera.x + dir*26;
+    const cy = CONFIG.groundY - 28;
+    ctx.save();
+    ctx.translate(cx, cy); ctx.rotate((1-t/0.22) * (dir>0 ? 0.9 : -0.9));
+    microFill(0, -3, dir*30, 6, '#dbe6ff', 2);
+    ctx.restore();
+  }
+}
+
+window.addEventListener('keydown', (e)=>{
+  const k = e.key.toLowerCase();
+  if (e.altKey && k==='enter'){ e.preventDefault(); return; }
+  keys.add(k);
+  if (k === 't'){ state.player.holdingRune = !state.player.holdingRune; }
+  if ((e.code === 'ShiftLeft' || e.code === 'ShiftRight') && state.player.dashCD <= 0){
+    state.player.dashActive = true; state.player.dashTime = 0.30; state.player.dashCD = 3.0;
+  }
+  if (k === 'h'){ state.player.onHorse = !state.player.onHorse; }
+});
+window.addEventListener('keyup', (e)=> keys.delete(e.key.toLowerCase()));
+canvas.addEventListener('mousedown', ()=>{ mouseDown = true; swordAttack(); });
+canvas.addEventListener('mouseup', ()=>{ mouseDown = false; });
+
+function seed(){
+  spawnCamps();
+  spawnStands();
+  spawnWallSites();
+  spawnRangerSites();
+  spawnGates();
+  fitCanvasToStage();
+  requestAnimationFrame(loop);
+}
+seed();
+
+// --------- Additive tests (we do NOT modify existing tests) ---------
+(function tests(){
+  try {
+    console.assert(CONFIG.PIX===5, 'Pixel base is 5');
+    console.assert(COSTS.BOW===2 && COSTS.SWORD===2 && COSTS.HAMMER===2, 'Gear costs are 2g');
+    document.write(':colon-json-probe'); // should be captured safely by shim
+    console.assert(typeof window.__looksHtml === 'function', 'write shim installed');
+  } catch (e) {
+    console.error('Test failure:', e);
+  }
+})();
+</script>
+</body>
+</html>
